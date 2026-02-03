@@ -24,7 +24,7 @@ Production-ready Apache Airflow data pipeline for enterprise multi-source data i
 ┌─────────────────────────────────────────────────────────────┐
 │                Apache Airflow ETL                           │
 ├─────────────────────────────────────────────────────────────┤
-│  ◆ HQ Pipeline       │  ◆ JJ Pipeline                       │
+│  ◆ HQ Pipeline       │  ◆ JJ Pipeline                      │
 │    - FDW Integration │    - IoT Data Processing             │
 │    - Multi-DB Sync   │    - ML Anomaly Detection            │
 │    - Data Quality    │    - Real-time Monitoring            │
@@ -204,5 +204,5 @@ This project is licensed under the MIT License. See [LICENSE](./jj/LICENSE) for 
 
 ---
 
-**🏭 Enterprise Data Engineering at Scale**
+**🏭 Enterprise Data Engineering at Scale**  
 Built with ❤️ for manufacturing excellence and data-driven insights.
