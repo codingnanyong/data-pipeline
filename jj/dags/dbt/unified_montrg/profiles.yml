@@ -9,19 +9,19 @@ unified_montrg:
     # ============================================================
     dev:
       type: postgres
-      host: "{{ env_var('DBT_HOST', '10.10.100.80') }}"
-      port: "{{ env_var('DBT_PORT', '5432') }}"
-      user: "{{ env_var('DBT_USER', 'mi') }}"
-      password: "{{ env_var('DBT_PASSWORD', '1q2w3e4r!') }}"
+      host: "{{ env_var('DBT_HOST', 'ip') }}"
+      port: "{{ env_var('DBT_PORT', 'port') }}"
+      user: "{{ env_var('DBT_USER', 'user') }}"
+      password: "{{ env_var('DBT_PASSWORD', '...') }}"
       dbname: unified_montrg
       schema: silver  # dbt 모델 결과 저장 스키마
     
     prod:
       type: postgres
-      host: "{{ env_var('DBT_HOST', '10.10.100.80') }}"
-      port: "{{ env_var('DBT_PORT', '5432') }}"
-      user: "{{ env_var('DBT_USER', 'mi') }}"
-      password: "{{ env_var('DBT_PASSWORD', '1q2w3e4r!') }}"
+      host: "{{ env_var('DBT_HOST', 'ip') }}"
+      port: "{{ env_var('DBT_PORT', 'port') }}"
+      user: "{{ env_var('DBT_USER', 'user') }}"
+      password: "{{ env_var('DBT_PASSWORD', '...') }}"
       dbname: unified_montrg
       schema: silver
   
