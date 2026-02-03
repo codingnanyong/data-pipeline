@@ -24,7 +24,7 @@ Production-ready Apache Airflow data pipeline for enterprise multi-source data i
 ┌─────────────────────────────────────────────────────────────┐
 │                Apache Airflow ETL                           │
 ├─────────────────────────────────────────────────────────────┤
-│  ◆ HQ Pipeline       │  ◆ JJ Pipeline                      │
+│  ◆ HQ Pipeline      │  ◆ JJ Pipeline                      │
 │    - FDW Integration │    - IoT Data Processing             │
 │    - Multi-DB Sync   │    - ML Anomaly Detection            │
 │    - Data Quality    │    - Real-time Monitoring            │
