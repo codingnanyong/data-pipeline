@@ -176,45 +176,51 @@ def should_process_file(
     return True
 
 
-def filter_remote_files(sftp, all_items: List[str], remote_base_path: str, 
-                       start_date: Optional[datetime], end_date: Optional[datetime]) -> List[dict]:
-    """원격 파일 목록에서 처리 대상 파일만 필터링"""
+def filter_remote_files(
+    sftp,
+    all_items: List[str],
+    remote_base_path: str,
+    start_date: Optional[datetime],
+    end_date: Optional[datetime],
+) -> List[dict]:
+    """원격 파일 목록에서 처리 대상 파일만 필터링
+
+    성능 개선:
+    - 항목마다 sftp.stat(절대경로)로 디렉터리 여부를 확인하던 부분 제거
+    - 파일 패턴 매칭 → 파일 크기 조회 → 날짜 필터 순으로 최소한의 호출만 수행
+    """
     import fnmatch
-    remote_files = []
+
+    remote_files: List[dict] = []
     current_dir = sftp.getcwd()
-    
+
     for item in all_items:
-        path_separator = "/" if not remote_base_path.endswith("/") else ""
-        remote_path = normalize_remote_path(f"{remote_base_path}{path_separator}{item}")
-        
-        # 디렉토리 건너뜀
-        try:
-            if sftp.stat(remote_path).st_mode & 0o040000:
-                logging.debug(f"디렉토리 건너뜀: {item}")
-                continue
-        except:
-            pass
-        
-        # 파일 패턴 매칭
+        # 1) 파일 패턴 매칭 (*.csv 등) – 디렉터리는 보통 패턴에 안 맞음
         if not any(fnmatch.fnmatch(item, pattern) for pattern in REMOTE_FILE_PATTERNS):
             logging.debug(f"  ⏭ 패턴 불일치: {item}")
             continue
         
-        # 파일 크기 조회
-        file_size = get_file_size(sftp, remote_path, current_dir)
+        # 2) 파일 크기 조회 (현재 디렉터리 기준)
+        file_size = get_file_size(sftp, item, current_dir)
         if file_size == 0:
-            logging.debug(f"  ⚠️ 파일 크기 조회 실패 (다운로드 시 확인): {item}")
+            # 0 byte 파일은 아예 대상에서 제외 (로컬에 저장하지 않음)
+            logging.warning(f"  ⏭ 0 byte 파일 건너뜀: {item}")
+            continue
         
-        # 파일 처리 여부 확인
-        if should_process_file(item, file_size, start_date, end_date) or file_size == 0:
-            remote_files.append({
-                "name": item,
-                "path": remote_path,
-                "size": file_size
-            })
+        # 3) 날짜/크기 기준으로 처리 대상 여부 결정
+        if should_process_file(item, file_size, start_date, end_date):
+            path_separator = "/" if not remote_base_path.endswith("/") else ""
+            remote_path = normalize_remote_path(f"{remote_base_path}{path_separator}{item}")
+            remote_files.append(
+                {
+                    "name": item,
+                    "path": remote_path,
+                    "size": file_size,
+                }
+            )
         else:
             logging.debug(f"  ⏭ 건너뜀: {item}")
-    
+
     return remote_files
 
 

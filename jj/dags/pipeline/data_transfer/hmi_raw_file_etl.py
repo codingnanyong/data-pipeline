@@ -30,19 +30,32 @@ from pipeline.data_transfer.hmi_raw_file_etl_config import (
     DEFAULT_ARGS,
     HMI_CONFIGS,
     INITIAL_START_DATE,
-    DAYS_OFFSET_FOR_INCREMENTAL,
     DAYS_OFFSET_FOR_BACKFILL,
     HOURS_OFFSET_FOR_HOURLY,
     INDO_TZ,
 )
+
+def get_configs_for_dag(dag_id: str):
+    """DAG 종류에 따라 사용할 HMI 설정 리스트 반환.
+    - Backfill: backfill_enabled=True인 것만
+    - Incremental/Hourly: incremental_enabled=True인 것만 (미설정 시 True)
+    """
+    if not dag_id:
+        return list(HMI_CONFIGS)
+    if dag_id.endswith("_backfill"):
+        return [c for c in HMI_CONFIGS if c.get("backfill_enabled", True)]
+    if dag_id.endswith("_incremental") or dag_id.endswith("_hourly"):
+        return [c for c in HMI_CONFIGS if c.get("incremental_enabled", True)]
+    return list(HMI_CONFIGS)
+
 from pipeline.data_transfer.hmi_raw_file_etl_tasks import (
     test_connection,
     list_remote_files,
     download_files,
     generate_summary_report,
     update_variable_after_run,
+    cleanup_old_remote_files,
 )
-
 
 # ════════════════════════════════════════════════════════════════
 # Helper Functions for DAGs
@@ -50,9 +63,9 @@ from pipeline.data_transfer.hmi_raw_file_etl_tasks import (
 
 def prepare_date_range(**kwargs) -> dict:
     """
-    날짜 범위 준비 (Hourly용 - 매시간 실행)
-    각 HMI별로 list_remote_files에서 Variable을 읽으므로 여기서는 공통 end_date만 반환
-    인도네시아 시간 기준으로 현재 시간 - 1시간까지 수집
+    날짜 범위 준비 (Incremental/Hourly용)
+    start_date는 각 HMI별 Variable(last_extract_time_...)에서 읽고, 여기서는 end_date만 반환.
+    인도네시아 시간 기준 현재 시간 - 1시간까지 수집.
     """
     # 인도네시아 시간 기준 현재 시간
     now_indo = datetime.now(INDO_TZ)
@@ -73,18 +86,26 @@ def prepare_date_range(**kwargs) -> dict:
 def prepare_backfill_date_range(**kwargs) -> dict:
     """
     날짜 범위 준비 (Backfill용)
-    과거부터 오늘-2일까지 수집
+    config의 INITIAL_START_DATE ~ 오늘-2일.
+    - 필터링: 하루 단위 범위
+    - Variable: hourly와 동일하게 'YYYY-MM-DD HH:MM' 형식으로 저장
     """
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = INITIAL_START_DATE.replace(hour=0, minute=0, second=0, microsecond=0)
     end_date = today - timedelta(days=DAYS_OFFSET_FOR_BACKFILL)
+
+    # 로그는 날짜+시간까지 표시
+    logging.info(
+        f"📅 Backfill 날짜 범위: "
+        f"{start_date.strftime('%Y-%m-%d %H:%M')} ~ {end_date.strftime('%Y-%m-%d 23:59')} 까지"
+    )
     
-    logging.info(f"📅 Backfill 날짜 범위: {start_date.strftime('%Y-%m-%d %H:%M')} ~ {end_date.strftime('%Y-%m-%d %H:%M')} 이전")
-    
-    # 일관성을 위해 'YYYY-MM-DD' 형식으로 저장 (ISO 형식 대신)
+    # Variable / XCom에 저장할 때도 hourly와 동일하게 'YYYY-MM-DD HH:MM' 형식 사용
+    # - start_date: 00:00
+    # - end_date:   23:59 (해당 날짜의 마지막까지 수집했다는 의미)
     return {
-        "start_date": start_date.strftime('%Y-%m-%d') if start_date else None,
-        "end_date": end_date.strftime('%Y-%m-%d') if end_date else None
+        "start_date": start_date.strftime('%Y-%m-%d %H:%M') if start_date else None,
+        "end_date": end_date.replace(hour=23, minute=59).strftime('%Y-%m-%d %H:%M') if end_date else None,
     }
 
 
@@ -110,10 +131,16 @@ def create_hmi_tasks(dag, date_range_func):
         dag=dag,
     )
     
-    # 각 HMI별로 태스크 생성
+    # 각 HMI별로 태스크 생성 (Backfill DAG는 backfill_enabled=True인 설정만 사용)
+    configs_to_use = get_configs_for_dag(dag.dag_id)
+    if not configs_to_use:
+        logging.warning(
+            "⚠️ 사용할 HMI 설정이 없습니다. "
+            "Backfill: backfill_enabled=True, Incremental/Hourly: incremental_enabled=True인 항목이 있는지 확인하세요."
+        )
     hmi_tasks = {}
-    
-    for hmi_config in HMI_CONFIGS:
+
+    for hmi_config in configs_to_use:
         hmi_id = hmi_config['hmi_id']
         
         # HMI별 태스크 ID 생성
@@ -170,41 +197,51 @@ def create_hmi_tasks(dag, date_range_func):
                     if date_range.get('end_date'):
                         end_date = parse_date(date_range['end_date'])
                 
+                # Backfill: start_date/end_date는 위 date_range(XCom)만 사용(init 기준). Incremental: start_date는 Variable에서 조회.
                 return list_remote_files(
                     hmi_config=config,
                     start_date=start_date,
                     end_date=end_date,
-                    use_variable=is_incremental,  # Incremental DAG인 경우 Variable 사용
+                    use_variable=is_incremental,
                     **kwargs
                 )
             return list_with_date_range
         
         # Incremental DAG인지 확인 (hourly도 incremental로 처리)
         is_incremental = dag.dag_id.endswith('_incremental') or dag.dag_id.endswith('_hourly')
-        
+        # Backfill DAG에서는 원격 cleanup 사용 안 함 (과거 데이터 수집만 수행)
+        use_cleanup = is_incremental
+
         list_task = PythonOperator(
             task_id=list_task_id,
             python_callable=create_list_callable(hmi_config, is_incremental),
             dag=dag,
         )
-        
-        # Task 3: 파일 다운로드
+
+        # Task 3: 원격 SFTP 오래된 파일 정리 (Incremental/Hourly만, Backfill 제외)
+        if use_cleanup:
+            cleanup_task = PythonOperator(
+                task_id=f"cleanup_old_files_{hmi_id}",
+                python_callable=cleanup_old_remote_files,
+                op_kwargs={"hmi_config": hmi_config},
+                dag=dag,
+            )
+
+        # Task 4: 파일 다운로드
         download_task = PythonOperator(
             task_id=download_task_id,
             python_callable=download_files,
             op_kwargs={"hmi_config": hmi_config},
             dag=dag,
         )
-        
-        # HMI별 태스크 의존성 설정 (각 HMI 내부 파이프라인)
-        test_task >> list_task >> download_task
-        
-        # 태스크 저장 (최종 요약 보고서에서 사용)
-        hmi_tasks[hmi_id] = {
-            "test": test_task,
-            "list": list_task,
-            "download": download_task,
-        }
+
+        # HMI별 태스크 의존성: list → (cleanup 있으면 cleanup →) download
+        if use_cleanup:
+            test_task >> list_task >> cleanup_task >> download_task
+            hmi_tasks[hmi_id] = {"test": test_task, "list": list_task, "download": download_task, "cleanup": cleanup_task}
+        else:
+            test_task >> list_task >> download_task
+            hmi_tasks[hmi_id] = {"test": test_task, "list": list_task, "download": download_task}
     
     # 전체 요약 보고서 (모든 HMI 처리 완료 후)
     generate_summary_task = PythonOperator(
@@ -213,9 +250,9 @@ def create_hmi_tasks(dag, date_range_func):
         dag=dag,
     )
     
-    # Variable 업데이트 (Incremental 또는 Hourly DAG에만 추가)
+    # Variable 업데이트 (Incremental/Hourly/Backfill DAG에서 모두 사용)
     update_var_task = None
-    if dag.dag_id.endswith('_incremental') or dag.dag_id.endswith('_hourly'):
+    if dag.dag_id.endswith('_incremental') or dag.dag_id.endswith('_hourly') or dag.dag_id.endswith('_backfill'):
         update_var_task = PythonOperator(
             task_id="update_variable",
             python_callable=update_variable_after_run,

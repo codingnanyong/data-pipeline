@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Container List Initialization
+# Container list initialization
 EXTRA_CONTAINERS=("airflow-webserver" "airflow-scheduler")
 
-# airflow-worker-1 ~ 3 Add
+# Add airflow-airflow-worker-1 ~ airflow-airflow-worker-5
 for i in $(seq 1 5); do
   EXTRA_CONTAINERS+=("airflow-airflow-worker-$i")
 done
