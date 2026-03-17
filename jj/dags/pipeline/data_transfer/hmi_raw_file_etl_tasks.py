@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+import fnmatch
 
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Connection, Variable
@@ -302,12 +303,16 @@ def list_remote_files(
     # DAG ID 확인하여 hourly 여부 판단 (incremental도 매시간 실행하므로 hourly로 처리)
     dag = kwargs.get('dag')
     is_hourly = dag and (dag.dag_id.endswith('_hourly') or dag.dag_id.endswith('_incremental')) if dag else False
-    
-    # Variable에서 날짜 범위 읽기
-    if use_variable and start_date is None:
-        start_date, _ = get_date_range_from_variable(hmi_config, is_hourly=is_hourly)
-    
-    # end_date 설정 (end_date가 None이고 use_variable이 True인 경우)
+
+    # Backfill: start_date/end_date는 XCom만 사용 (prepare_backfill_date_range → INITIAL_START_DATE ~ 오늘-2일). Variable 미사용.
+    # Incremental: start_date는 Variable(last_extract_time_...) 기준, end_date는 XCom(현재-1시간 등) 기준.
+    if use_variable:
+        # Incremental: Variable에서 마지막 처리 시점을 읽어 start_date로 사용
+        if start_date is None:
+            start_date, _ = get_date_range_from_variable(hmi_config, is_hourly=is_hourly)
+    # (Backfill이면 use_variable=False → 위 분기 진입 안 함, 전달된 start_date/end_date 그대로 사용)
+
+    # end_date 설정 (Incremental에서만; end_date가 None이면 현재-1시간 등으로 계산)
     if use_variable and end_date is None:
         if is_hourly:
             # Hourly: 인도네시아 시간 기준 현재 시간 - 1시간
@@ -318,7 +323,16 @@ def list_remote_files(
             # Daily: 전일까지
             today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             end_date = today - timedelta(days=DAYS_OFFSET_FOR_INCREMENTAL)
-    
+
+    # Incremental에서 Variable이 미래 날짜인 경우 (start_date > end_date): 수집 구간이 비어 있으므로 start_date 제거
+    if use_variable and start_date is not None and end_date is not None and start_date > end_date:
+        logging.warning(
+            f"⚠️ [{hmi_id}] Variable 시작 시간이 종료 시간보다 미래입니다 "
+            f"(start_date={start_date.strftime('%Y-%m-%d %H:%M')}, end_date={end_date.strftime('%Y-%m-%d %H:%M')}). "
+            "start_date를 무시하고 end_date 이전 전체를 대상으로 합니다."
+        )
+        start_date = None
+
     # 로깅
     date_filter_desc = format_date_filter_desc(start_date, end_date)
     logging.info(f"📋 [{hmi_id}] HMI RAW DATA 파일 목록 조회 시작: {remote_base_path}")
@@ -622,6 +636,7 @@ def generate_summary_report(**kwargs) -> dict:
     all_results = []
     total_files_listed = 0
     total_files_downloaded = 0
+    total_files_deleted_remote = 0
     total_size_listed = 0
     total_size_downloaded = 0
     
@@ -636,9 +651,12 @@ def generate_summary_report(**kwargs) -> dict:
         hmi_id = hmi_config['hmi_id']
         list_task_id = f"list_remote_files_{hmi_id}"
         download_task_id = f"download_files_{hmi_id}"
+        cleanup_task_id = f"cleanup_old_files_{hmi_id}"
         
         list_result = ti.xcom_pull(task_ids=list_task_id)
         download_result = ti.xcom_pull(task_ids=download_task_id)
+        # Incremental/Hourly에서만 존재하는 cleanup 태스크 결과 (Backfill에서는 None)
+        cleanup_result = ti.xcom_pull(task_ids=cleanup_task_id)
         
         # 각 HMI별 end_date 저장 (Variable 업데이트용)
         # Skip된 경우 공통 end_date 사용
@@ -649,10 +667,19 @@ def generate_summary_report(**kwargs) -> dict:
             # Skip된 경우 공통 end_date 사용
             hmi_end_date = common_end_date
         
+        # 원격 삭제 통계
+        deleted_count = 0
+        if cleanup_result and isinstance(cleanup_result, dict):
+            deleted = cleanup_result.get("deleted") or []
+            deleted_count = len(deleted)
+            total_files_deleted_remote += deleted_count
+        
         all_results.append({
             "hmi_id": hmi_id,
             "list_result": list_result,
             "download_result": download_result,
+            "cleanup_result": cleanup_result,
+            "deleted_count": deleted_count,
             "end_date": hmi_end_date,
         })
         
@@ -673,6 +700,7 @@ def generate_summary_report(**kwargs) -> dict:
         "totals": {
             "files_listed": total_files_listed,
             "files_downloaded": total_files_downloaded,
+            "files_deleted_remote": total_files_deleted_remote,
             "size_listed_bytes": total_size_listed,
             "size_downloaded_bytes": total_size_downloaded,
         }
@@ -692,6 +720,7 @@ def generate_summary_report(**kwargs) -> dict:
         hmi_id = result['hmi_id']
         list_result = result['list_result']
         download_result = result['download_result']
+        deleted_count = result.get('deleted_count', 0)
         
         logging.info(f"  [{hmi_id}]")
         if list_result:
@@ -701,6 +730,8 @@ def generate_summary_report(**kwargs) -> dict:
             skipped_count += 1
         if download_result:
             logging.info(f"    - 다운로드: {download_result.get('total_count', 0)}개")
+        if deleted_count:
+            logging.info(f"    - 원격 삭제: {deleted_count}개")
     
     if skipped_count > 0:
         logging.info(f"  ⏭️ Skip된 HMI: {skipped_count}개 (다음 실행 시 재시도)")
@@ -778,3 +809,119 @@ def update_variable_after_run(**kwargs):
     
     logging.info(f"✅ 총 {updated_count}개 HMI의 Variable 업데이트 완료 (Skip된 HMI: {skipped_count}개)")
 
+
+
+def cleanup_old_remote_files(hmi_config: dict, **kwargs) -> dict:
+    """원격 SFTP 경로(remote_base_path)에서 retention_days 이전 파일 삭제 (HMI별)"""
+    from pipeline.data_transfer.hmi_raw_file_etl_config import INDO_TZ
+
+    hmi_id = hmi_config["hmi_id"]
+    sftp_conn_id = hmi_config["sftp_conn_id"]
+    remote_base_path = normalize_remote_path(hmi_config["remote_base_path"])
+
+    retention_days = int(
+        hmi_config.get("remote_retention_days", hmi_config.get("local_retention_days", 30))
+    )
+    cutoff = datetime.now(INDO_TZ) - timedelta(days=retention_days)
+
+    if not hmi_config.get("remote_cleanup_enabled", True):
+        logging.info(
+            f"ℹ️ [{hmi_id}] cleanup_old_remote_files: remote_cleanup_enabled=False, 원격 삭제 건너뜀."
+        )
+        return {
+            "status": "skipped",
+            "hmi_id": hmi_id,
+            "reason": "disabled",
+            "deleted": [],
+            "skipped": [],
+        }
+
+    logging.info(
+        f"🧹 [{hmi_id}] cleanup_old_remote_files 시작 - 원격 경로: {remote_base_path}, "
+        f"보존 기간: {retention_days}일 (cutoff={cutoff})"
+    )
+
+    sftp_hook = SFTPHook(ftp_conn_id=sftp_conn_id)
+    deleted = []
+    skipped = []
+
+    try:
+        with sftp_hook.get_conn() as sftp:
+            sftp.chdir(remote_base_path)
+            logging.info(f"[{hmi_id}] 원격 정리 대상 디렉토리: {sftp.getcwd()}")
+
+            # listdir_attr 로 mtime 포함된 정보 가져오기
+            entries = sftp.listdir_attr(".")
+            logging.info(f"[{hmi_id}] 원격 항목 수: {len(entries)}")
+
+            for entry in entries:
+                name = entry.filename
+
+                # 파일 패턴 필터 (*.csv 등)
+                if not any(fnmatch.fnmatch(name, pattern) for pattern in REMOTE_FILE_PATTERNS):
+                    continue
+
+                try:
+                    mtime = datetime.fromtimestamp(entry.st_mtime, tz=INDO_TZ)
+                except Exception as e:
+                    logging.warning(
+                        f"⚠️ [{hmi_id}] 원격 파일 mtime 확인 실패: {name} - {e}"
+                    )
+                    skipped.append(
+                        {"name": name, "reason": "stat_failed", "error": str(e)}
+                    )
+                    continue
+
+                if mtime < cutoff:
+                    try:
+                        sftp.remove(name)
+                        logging.info(
+                            f"  🗑️ [{hmi_id}] 원격 오래된 파일 삭제: {name} (mtime={mtime})"
+                        )
+                        deleted.append({"name": name, "mtime": mtime.isoformat()})
+                    except Exception as e:
+                        logging.error(
+                            f"  ❌ [{hmi_id}] 원격 파일 삭제 실패: {name} - {e}"
+                        )
+                        skipped.append(
+                            {
+                                "name": name,
+                                "reason": "delete_failed",
+                                "error": str(e),
+                            }
+                        )
+                else:
+                    skipped.append(
+                        {
+                            "name": name,
+                            "reason": "newer_than_cutoff",
+                            "mtime": mtime.isoformat(),
+                        }
+                    )
+
+        try:
+            sftp_hook.close_conn()
+        except Exception:
+            pass
+
+        logging.info(
+            f"🧹 [{hmi_id}] cleanup_old_remote_files 완료 - 삭제 성공={len(deleted)}개, "
+            f"유지/실패 포함 기타={len(skipped)}개"
+        )
+
+        return {
+            "status": "success",
+            "hmi_id": hmi_id,
+            "deleted": deleted,
+            "skipped": skipped,
+        }
+    except Exception as e:
+        # 오류 발생 시에도 연결 종료 시도
+        try:
+            if sftp_hook:
+                sftp_hook.close_conn()
+        except Exception:
+            pass
+
+        logging.error(f"❌ [{hmi_id}] cleanup_old_remote_files 중 오류: {e}")
+        raise

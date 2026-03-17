@@ -1,23 +1,23 @@
-# Flet Monitoring Application Database Schema
+# 📊 Flet Monitoring Application Database Schema
 
-Database schema and configuration files for the Flet-based monitoring application, part of the Airflow data pipeline infrastructure.
+Database schema and configuration files for the Flet-based monitoring application, which is part of the Airflow data pipeline infrastructure.
 
-## Overview
+## 🌐 Overview
 
-This directory contains the database schema definitions for a Python-based monitoring application built with Flet framework. The application provides real-time data monitoring and alerting capabilities for temperature sensors and other IoT devices.
+This directory contains the database schema definitions for a Python-based monitoring application built with the Flet framework. The application provides real-time data monitoring and alerting capabilities for temperature sensors and other IoT devices.
 
-## Features
+## ✨ Features
 
-- Real-time data monitoring and collection
-- Temperature sensor data management
-- Alert system with customizable thresholds
-- Location-based monitoring and tracking
-- Database integration for data persistence
-- Integration with Airflow data pipeline
+- **Real-time monitoring** of incoming sensor data
+- **Temperature sensor management** for multiple devices
+- **Alert system** with customizable thresholds and history
+- **Location-based tracking** of sensors and devices
+- **Relational database integration** for reliable persistence
+- **Tight integration** with the Airflow data pipeline
 
-## Project Structure
+## 📁 Project Structure
 
-```
+```text
 flet_montrg/
 ├── schema/                     # Database schema files
 │   ├── alert_subscriptions.sql # Alert subscription management
@@ -30,58 +30,60 @@ flet_montrg/
 └── README.md                   # This file
 ```
 
-## Database Schema
+## 🗄️ Database Schema
 
 The application uses a relational database with the following main entities:
 
 ### Core Tables
+
 - **sensor**: Device information and configuration
 - **temperature**: Temperature readings from sensors
 - **location**: Sensor location information
 
 ### Alert System
+
 - **alerts**: Alert history and notifications
 - **thresholds**: Customizable alert thresholds
 - **alert_subscriptions**: User notification preferences
 
-## Database Setup
+## 🚀 Database Setup
 
-1. **Schema Creation**: Execute the SQL files in the `sql/` directory in the following order:
+1. **Schema creation**: Execute the SQL files in the `schema/` directory in the following order:
+
    ```sql
    -- 1. Create base tables
-   sensor.sql
-   location.sql
-   temperature.sql
-   
+   sensor.sql;
+   location.sql;
+   temperature.sql;
+
    -- 2. Create alert system tables
-   thresholds.sql
-   alerts.sql
-   alert_subscriptions.sql
+   thresholds.sql;
+   alerts.sql;
+   alert_subscriptions.sql;
    ```
 
-2. **ERD Reference**: Review `hq_flet_montrg_ERD.pdf` for detailed entity relationships
+2. **ERD reference**: Review `hq_flet_montrg_ERD.pdf` for detailed entity relationships.
+3. **Airflow integration**: Ensure your Airflow DAGs use the same schema and connection configuration.
 
-3. **Airflow Integration**: This schema is designed to work with Airflow DAGs for data processing
-
-## Integration with Airflow
+## 🌀 Integration with Airflow
 
 This database schema is part of the larger Airflow data pipeline infrastructure:
-- **Data Ingestion**: Airflow DAGs collect data from sensors
-- **Data Processing**: Transform and validate sensor data
-- **Alert Generation**: Trigger alerts based on thresholds
-- **Data Storage**: Persist processed data in these tables
 
-## Usage
+- **Data ingestion**: Airflow DAGs collect data from sensors
+- **Data processing**: Transform and validate sensor data
+- **Alert generation**: Trigger alerts based on thresholds
+- **Data storage**: Persist processed data in the `sensor`, `temperature`, and related tables
 
-1. Set up the database using the SQL files in the `schema/` directory
-2. Configure Airflow DAGs to use these tables
-3. Deploy the Flet monitoring application
-4. Monitor data flow through the Airflow pipeline
+## 🧭 Usage Guide
 
-## Related Components
+1. Set up the database using the SQL files in the `schema/` directory.
+2. Configure Airflow DAGs to read and write to these tables.
+3. Deploy the Flet monitoring application (frontend).
+4. Monitor data flow and alerts via the UI and Airflow UI.
 
-- **Flet Application**: Frontend monitoring interface
+## 🔗 Related Components
+
+- **Flet application**: Frontend monitoring interface
 - **Airflow DAGs**: Data pipeline orchestration
-- **Sensor Integration**: IoT device connectivity
-- **Alert System**: Notification management
-
+- **Sensor integration**: IoT device connectivity
+- **Alert system**: Notification and subscription management
