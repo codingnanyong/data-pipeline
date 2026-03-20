@@ -33,47 +33,53 @@ INCREMENT_KEY = "last_extract_time_sss_php_so"
 # 2️⃣ Daily Incremental Collection
 # ────────────────────────────────────────────────────────────────
 def daily_incremental_collection_task(**kwargs) -> dict:
-    """UTC 00:00:00 실행 시 마지막 수집 시점부터 오늘 06:30:00까지 수집"""
+    """수집: orchestration에서 hourly로 트리거 시 '실행시점-1시간'까지, 그 외(수동 등)는 오늘 06:30:00까지"""
     oracle = OracleHelper(conn_id=ORACLE_CONN_ID)
     pg = PostgresHelper(conn_id=POSTGRES_CONN_ID)
-    
-    # Airflow execution date (UTC 기준)
-    # data_interval_end가 있으면 사용, 없으면 execution_date 사용
-    execution_date = kwargs.get('data_interval_end') or kwargs.get('execution_date')
-    
-    # 목표 종료 시점 계산 (오늘 06:30:00)
-    if execution_date:
-        # UTC 시간을 인도네시아 시간으로 변환
-        if execution_date.tzinfo is None:
-            # UTC로 가정
-            execution_date_utc = execution_date.replace(tzinfo=timezone.utc)
-        else:
-            execution_date_utc = execution_date.astimezone(timezone.utc)
-        
-        # UTC를 인도네시아 시간으로 변환 (UTC+7)
-        execution_date_indo = execution_date_utc.astimezone(INDO_TZ)
-        logging.info(f"📅 실행 시간 (UTC): {execution_date_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-        logging.info(f"📅 실행 시간 (인도네시아): {execution_date_indo.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-        
-        # 목표 종료 시점: 오늘 06:30:00
-        target_end_date = execution_date_indo.replace(hour=6, minute=30, second=0, microsecond=0)
-    else:
-        # execution_date가 없으면 (수동 실행 등) 현재 시간 기준으로 계산
+
+    dag_run = kwargs.get("dag_run")
+    conf = (dag_run.conf or {}) if dag_run else {}
+    is_hourly = conf.get("hourly", False)
+
+    if is_hourly:
+        # hourly: 항상 현재 인도네시아 시간 기준으로 직전 1시간 끝을 사용
         now_indo = datetime.now(INDO_TZ)
-        target_end_date = now_indo.replace(hour=6, minute=30, second=0, microsecond=0)
-        logging.info(f"⚠️ execution_date가 없어서 현재 시간 기준으로 계산")
+        one_hour_ago = now_indo - timedelta(hours=1)
+        target_end_date = one_hour_ago.replace(minute=0, second=0, microsecond=0)
+        logging.info(f"📅 목표 종료 (hourly, now 기준): {target_end_date.strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        execution_date = kwargs.get('data_interval_end') or kwargs.get('execution_date')
+        if execution_date:
+            if execution_date.tzinfo is None:
+                execution_date_utc = execution_date.replace(tzinfo=timezone.utc)
+            else:
+                execution_date_utc = execution_date.astimezone(timezone.utc)
+            execution_date_indo = execution_date_utc.astimezone(INDO_TZ)
+            logging.info(f"📅 실행 시간 (UTC): {execution_date_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            logging.info(f"📅 실행 시간 (인도네시아): {execution_date_indo.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            target_end_date = execution_date_indo.replace(hour=6, minute=30, second=0, microsecond=0)
+        else:
+            now_indo = datetime.now(INDO_TZ)
+            target_end_date = now_indo.replace(hour=6, minute=30, second=0, microsecond=0)
+            logging.info(f"⚠️ execution_date가 없어서 현재 시간 기준으로 계산")
     
-    # 마지막 수집 시점 확인
+    # 마지막 수집 시점 확인 (Variable 있으면 항상 (Variable+1초)~target 수집 → 전환 시 누락 없음)
     last_extract_time_str = Variable.get(INCREMENT_KEY, default_var=None)
-    
+
     if last_extract_time_str:
-        # 마지막 수집 시점이 있으면 그 시점 + 1초부터 시작
         last_extract_time = parse_datetime(last_extract_time_str)
+
+        # 안전하게 둘 다 인도네시아 시간대로 통일 (naive/aware 혼합 비교 방지)
         if last_extract_time.tzinfo is None:
             last_extract_time = last_extract_time.replace(tzinfo=INDO_TZ)
-        
+        else:
+            last_extract_time = last_extract_time.astimezone(INDO_TZ)
+
+        if target_end_date.tzinfo is None:
+            target_end_date = target_end_date.replace(tzinfo=INDO_TZ)
+
         logging.info(f"📌 마지막 수집 시점: {last_extract_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        
+
         # 마지막 수집 시점이 이미 목표 종료 시점 이후면 스킵
         if last_extract_time >= target_end_date:
             logging.info(f"⏭️ 이미 수집 완료: 마지막 수집 시점({last_extract_time.strftime('%Y-%m-%d %H:%M:%S')}) >= 목표 종료 시점({target_end_date.strftime('%Y-%m-%d %H:%M:%S')})")
@@ -90,11 +96,15 @@ def daily_incremental_collection_task(**kwargs) -> dict:
         end_date = target_end_date
         logging.info(f"📅 수집 구간: {start_date.strftime('%Y-%m-%d %H:%M:%S')} ~ {end_date.strftime('%Y-%m-%d %H:%M:%S')} (마지막 수집 시점부터)")
     else:
-        # 마지막 수집 시점이 없으면 전날 06:30:00부터 시작
-        yesterday_indo = target_end_date - timedelta(days=1)
-        start_date = yesterday_indo.replace(hour=6, minute=30, second=0, microsecond=0)
-        end_date = target_end_date
-        logging.info(f"📅 수집 구간: {start_date.strftime('%Y-%m-%d %H:%M:%S')} ~ {end_date.strftime('%Y-%m-%d %H:%M:%S')} (Variable 없음, 전날 06:30부터)")
+        if is_hourly:
+            start_date = target_end_date - timedelta(hours=1)
+            end_date = target_end_date
+            logging.info(f"📅 수집 구간: {start_date.strftime('%Y-%m-%d %H:%M:%S')} ~ {end_date.strftime('%Y-%m-%d %H:%M:%S')} (Variable 없음, 직전 1시간)")
+        else:
+            yesterday_indo = target_end_date - timedelta(days=1)
+            start_date = yesterday_indo.replace(hour=6, minute=30, second=0, microsecond=0)
+            end_date = target_end_date
+            logging.info(f"📅 수집 구간: {start_date.strftime('%Y-%m-%d %H:%M:%S')} ~ {end_date.strftime('%Y-%m-%d %H:%M:%S')} (Variable 없음, 전날 06:30부터)")
     
     start_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_date.strftime("%Y-%m-%d %H:%M:%S")

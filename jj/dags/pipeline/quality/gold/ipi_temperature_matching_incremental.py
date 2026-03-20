@@ -8,7 +8,10 @@ from typing import Tuple
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
-from dags.pipeline.quality.gold.common.ipi_temperature_matching_common import process_single_date
+from dags.pipeline.quality.gold.common.ipi_temperature_matching_common import (
+    process_single_date,
+    submit_spark_temperature_matching,
+)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -64,25 +67,32 @@ def get_processing_time_range(**context) -> Tuple[str, str]:
 # ════════════════════════════════════════════════════════════════
 
 def run_temperature_matching(**context) -> dict:
-    """메인 ETL 함수 (증분 처리)"""
+    """메인 ETL 함수 (증분 처리) - 기존 pandas 구현 (원본 테이블)"""
     start_date, end_date = get_processing_time_range(**context)
-    
+
     if start_date is None or end_date is None:
         logging.info("✅ 처리할 날짜가 없습니다. (이미 최신 상태)")
-        return {"status": "success", "rows_processed": 0, "rows_inserted": 0, "message": "Already up to date", "processed_date": None}
-    
+        return {"status": "success", "rows_processed": 0, "message": "Already up to date", "processed_date": None}
+
     try:
         result = process_single_date(start_date)
-        
+
         if result.get('status') == 'success':
             Variable.set(INCREMENT_KEY, start_date)
             logging.info(f"✅ Variable `{INCREMENT_KEY}` 업데이트: {start_date}")
-        
+
         return result
-        
+
     except Exception as e:
         logging.error(f"❌ Temperature Matching 실패: {str(e)}", exc_info=True)
         return {"status": "failed", "error": str(e)}
+
+
+def run_spark_temperature_matching(**context) -> dict:
+    """Spark 버전 ETL (병렬 검증) - 항상 2일 전 데이터를 처리, _spark suffix 테이블에만 적재"""
+    target_date = (datetime.utcnow() - timedelta(days=2)).strftime('%Y-%m-%d')
+    logging.info(f"🔥 Spark 처리 날짜 (고정 2일 전): {target_date}")
+    return submit_spark_temperature_matching(target_date=target_date, suffix="_spark")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -97,11 +107,19 @@ with DAG(
     catchup=False,
     tags=["JJ", "IP", "Quality", "Gold layer", "Incremental", "Temperature_matching_model"],
 ) as dag:
-    
+
+    # 기존 pandas 구현 → gold.ipi_temperature_matching (원본, 변경 없음)
     temperature_matching_task = PythonOperator(
         task_id="run_temperature_matching",
         python_callable=run_temperature_matching,
     )
-    
-    temperature_matching_task
+
+    # Spark 구현 → gold.ipi_temperature_matching_spark (병렬 검증용)
+    spark_temperature_matching_task = PythonOperator(
+        task_id="run_spark_temperature_matching",
+        python_callable=run_spark_temperature_matching,
+    )
+
+    # pandas / Spark 병렬 실행 (서로 독립)
+    [temperature_matching_task, spark_temperature_matching_task]
 

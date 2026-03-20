@@ -1,10 +1,11 @@
 """
 HMI Raw Data ETL Configuration
-==============================
-설정 상수 및 HMI 설정 정의
+===============================
+Configuration constants and HMI transfer settings.
 """
 
 import os
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 # ════════════════════════════════════════════════════════════════
@@ -22,82 +23,152 @@ DEFAULT_ARGS = {
 }
 
 # ════════════════════════════════════════════════════════════════
-# 파일 처리 설정
+# File processing settings
 # ════════════════════════════════════════════════════════════════
 
-# 파일 패턴 (HMI RAW DATA 파일 형식)
-REMOTE_FILE_PATTERNS = ["*.csv"]  # RAW DATA 파일 확장자
+# File pattern (HMI raw data)
+REMOTE_FILE_PATTERNS = ["*.csv"]
 
-# 로컬 저장 기본 경로
-LOCAL_BASE_DIR = os.getenv("HMI_RAW_DATA_BASE_PATH", "/media/btx/hmi_raw")
+# Local base directory for downloaded/archived CSV files.
+# Env precedence:
+# - ASE_DIR (preferred)
+# - HMI_RAW_DATA_BASE_PATH (legacy)
+# - default: placeholder (must be overridden via env)
+HMI_RAW_ROOT_DEFAULT = "/path/to/your/local/hmi_raw"
+HMI_RAW_ROOT = (
+    os.getenv("ASE_DIR")
+    or os.getenv("HMI_RAW_DATA_BASE_PATH")
+    or HMI_RAW_ROOT_DEFAULT
+)
 
-# 파일 검증 옵션
-VERIFY_FILE_SIZE = True  # 다운로드 후 파일 크기 검증
-VERIFY_FILE_HASH = False  # 파일 해시 검증 (MD5, SHA256 등) - 선택적
+HMI_RAW_ROOT_PATH = Path(HMI_RAW_ROOT).expanduser().absolute()
+if not (os.getenv("ASE_DIR") or os.getenv("HMI_RAW_DATA_BASE_PATH")):
+    raise ValueError("Set ASE_DIR (preferred) or HMI_RAW_DATA_BASE_PATH. Using the placeholder default is not allowed.")
 
-# 파일 크기 필터링 (선택적)
-MIN_FILE_SIZE = 0  # 최소 파일 크기 (bytes, 0이면 제한 없음)
-MAX_FILE_SIZE = None  # 최대 파일 크기 (bytes, None이면 제한 없음)
+# Basic safety checks to avoid accidentally targeting root.
+# (The safe_local_path() function below also guarantees writes stay under HMI_RAW_ROOT_PATH.)
+if str(HMI_RAW_ROOT_PATH) == str(Path("/").absolute()):
+    raise ValueError("Unsafe HMI raw root directory: '/' is not allowed.")
 
-# 대용량 파일 처리 설정
-LARGE_FILE_THRESHOLD_MB = 100  # 대용량 파일 기준 (MB, 이 크기 이상이면 상세 로깅)
-DOWNLOAD_TIMEOUT_SECONDS = 3600  # 다운로드 타임아웃 (초, 1시간 기본값)
 
-# 시간대 설정
-INDO_TZ = timezone(timedelta(hours=7))  # 인도네시아 시간대 (UTC+7)
+def safe_local_path(root: Path, *parts: str) -> str:
+    """
+    Join path parts under `root` and ensure the result stays within `root`.
+    This prevents accidental path traversal due to misconfiguration.
+    """
+    candidate = root.joinpath(*parts).absolute()
+    root_abs = root.absolute()
+    if candidate != root_abs and not str(candidate).startswith(str(root_abs) + os.sep):
+        raise ValueError("Refusing to create a path outside the configured HMI raw root directory.")
+    return str(candidate)
 
-# 날짜 필터링 설정
-INITIAL_START_DATE = datetime(2025, 12, 27)  # Backfill 시작 날짜
-DAYS_OFFSET_FOR_INCREMENTAL = 1  # Incremental: 오늘 - 1일까지만
-DAYS_OFFSET_FOR_BACKFILL = 2  # Backfill: 오늘 - 2일까지만
-HOURS_OFFSET_FOR_HOURLY = 1  # Hourly: 현재 시간 - 1시간까지만
+
+# Remote base directory on the SFTP server for HMI raw files.
+# This must not be hard-coded to a real path in-repo.
+# Override via env var:
+# - HMI_REMOTE_BASE_PATH (preferred)
+# - HMI_SFTP_REMOTE_BASE_PATH (legacy)
+REMOTE_BASE_DEFAULT = "/path/to/your/remote/raw/data"
+REMOTE_BASE = (
+    os.getenv("HMI_REMOTE_BASE_PATH")
+    or os.getenv("HMI_SFTP_REMOTE_BASE_PATH")
+    or REMOTE_BASE_DEFAULT
+)
+
+
+def safe_remote_base_path(remote_base: str) -> str:
+    """
+    Basic safety checks for remote paths used in SFTP transfers.
+    We prevent trivial traversal patterns to reduce risk of misconfiguration.
+    """
+    if not remote_base or remote_base.strip() == "":
+        raise ValueError("Unsafe remote_base_path: empty.")
+    if ".." in remote_base:
+        raise ValueError("Unsafe remote_base_path: contains '..'. Please provide a safe absolute path.")
+    # Allow either unix absolute (/...) or windows absolute (C:\...) style.
+    if not (remote_base.startswith("/") or (len(remote_base) >= 2 and remote_base[1] == ":")):
+        raise ValueError("Unsafe remote_base_path: expected an absolute path (starts with '/' or 'C:').")
+    return remote_base
+
+
+REMOTE_BASE = safe_remote_base_path(REMOTE_BASE)
+
+# File validation options
+VERIFY_FILE_SIZE = True
+VERIFY_FILE_HASH = False  # Optional: enable checksum verification (MD5/SHA256/etc.)
+
+MIN_FILE_SIZE = 0  # bytes (0 means no limit)
+MAX_FILE_SIZE = None  # bytes (None means no limit)
+
+LARGE_FILE_THRESHOLD_MB = 100  # MB threshold for detailed logging
+DOWNLOAD_TIMEOUT_SECONDS = 3600  # seconds
+
+# Time zone (UTC+7)
+INDO_TZ = timezone(timedelta(hours=7))
+
+INITIAL_START_DATE = datetime(2025, 12, 27)  # Backfill start date
+DAYS_OFFSET_FOR_INCREMENTAL = 1  # Incremental: until today - 1 day
+DAYS_OFFSET_FOR_BACKFILL = 2  # Backfill: until today - 2 days
+HOURS_OFFSET_FOR_HOURLY = 1  # Hourly: until current time - 1 hour
 
 # ════════════════════════════════════════════════════════════════
-# HMI별 설정 리스트
+# HMI settings list
 # ════════════════════════════════════════════════════════════════
 
-# 각 HMI별로 SFTP 연결, 원격 경로, 로컬 저장 경로를 지정
-# process_code: 공정 코드 (예: "os", "extrusion", "mixing" 등)
-# equipment_code: 설비 약어 (예: "banb", "extr", "mix" 등)
-# incremental_enabled: Incremental/Hourly DAG 실행 시 이 HMI 포함 여부 (미설정 시 True)
-# backfill_enabled: Backfill DAG 실행 시 이 HMI 포함 여부 (미설정 시 True)
+# Per-HMI transfer settings
+# process_code: process code (e.g. "os", "extrusion", "mixing")
+# equipment_code: equipment code (e.g. "banb", "extr", "mix")
+# incremental_enabled: include this HMI in Incremental/Hourly runs
+# backfill_enabled: include this HMI in Backfill runs
 HMI_CONFIGS = [
     {
-        "hmi_id": "banbury03",
-        "process_code": "os",  # 공정 코드
-        "equipment_code": "banb",  # 설비 약어
-        "sftp_conn_id": "sft_jj_banbury_03",
-        "remote_base_path": r"C:\ccs_prg\EA_RAW\RAW_DATA",  # Windows 경로
-        "local_save_path": os.path.join(LOCAL_BASE_DIR, "os/osr/banbury/03"),
+        "hmi_id": "Machine03",
+        "process_code": "os",
+        "equipment_code": "banb",
+        "sftp_conn_id": "conn_id_of_sftp_server",
+        "remote_base_path": REMOTE_BASE,
+        "local_save_path": safe_local_path(HMI_RAW_ROOT_PATH, "os", "osr", "Machine03"),
         "remote_retention_days": 30,
         "remote_cleanup_enabled": True,
-        "incremental_enabled": True,  # Incremental/Hourly DAG에서 이 원격지 포함
-        "backfill_enabled": False,  # Backfill DAG에서 이 원격지 포함
+        "incremental_enabled": True,
+        "backfill_enabled": False,
     },
-    # TODO: 추가 HMI 정보를 여기에 추가
+    # TODO: add more HMI entries here
     {
-        "hmi_id": "ip04",
+        "hmi_id": "Machine04",
         "process_code": "ip",
         "equipment_code": "ip",
-        "sftp_conn_id": "sftp_jj_ip_04",
-        "remote_base_path": r"C:\ccs_prg\EA_RAW\RAW_DATA",
-        "local_save_path": os.path.join(LOCAL_BASE_DIR, "ip/ipi/04"),
+        "sftp_conn_id": "conn_id_of_sftp_server",
+        "remote_base_path": REMOTE_BASE,
+        "local_save_path": safe_local_path(HMI_RAW_ROOT_PATH, "ip", "ipi", "Machine04"),
         "remote_retention_days": 30,
         "remote_cleanup_enabled": True,
-        "incremental_enabled": True,  # Incremental/Hourly DAG에서 이 원격지 포함
-        "backfill_enabled": False,  # Backfill DAG에서 이 원격지 포함
+        "incremental_enabled": True,
+        "backfill_enabled": False,
     },
-     {
-        "hmi_id": "ip37",
+    {
+        "hmi_id": "Machine12",
         "process_code": "ip",
         "equipment_code": "ip",
-        "sftp_conn_id": "sftp_jj_ip_37",
-        "remote_base_path": r"C:\ccs_prg\EA_RAW\RAW_DATA",
-        "local_save_path": os.path.join(LOCAL_BASE_DIR, "ip/ipi/37"),
+        "sftp_conn_id": "conn_id_of_sftp_server",
+        "remote_base_path": REMOTE_BASE,
+        "local_save_path": safe_local_path(HMI_RAW_ROOT_PATH, "ip", "ipi", "Machine12"),
         "remote_retention_days": 30,
         "remote_cleanup_enabled": True,
-        "incremental_enabled": True,  # Incremental/Hourly DAG에서 이 원격지 포함
-        "backfill_enabled": False,  # Backfill DAG에서 이 원격지 포함
+        "incremental_enabled": True,
+        "backfill_enabled": False,
+    },
+    {
+        "hmi_id": "Machine37",
+        "process_code": "ip",
+        "equipment_code": "ip",
+        "sftp_conn_id": "conn_id_of_sftp_server",
+        "remote_base_path": REMOTE_BASE,
+        "local_save_path": safe_local_path(HMI_RAW_ROOT_PATH, "ip", "ipi", "Machine37"),
+        "remote_retention_days": 30,
+        "remote_cleanup_enabled": True,
+        "incremental_enabled": True,
+        "backfill_enabled": False,
     },
 ]
 

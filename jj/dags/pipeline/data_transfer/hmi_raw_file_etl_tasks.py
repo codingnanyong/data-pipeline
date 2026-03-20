@@ -32,6 +32,16 @@ from pipeline.data_transfer.hmi_raw_file_etl_utils import (
 )
 
 
+def get_configs_for_current_dag(dag) -> list[dict]:
+    """현재 DAG 종류에 맞는 HMI 설정만 반환."""
+    dag_id = dag.dag_id if dag else ""
+    if dag_id.endswith("_backfill"):
+        return [c for c in HMI_CONFIGS if c.get("backfill_enabled", True)]
+    if dag_id.endswith("_incremental") or dag_id.endswith("_hourly"):
+        return [c for c in HMI_CONFIGS if c.get("incremental_enabled", True)]
+    return list(HMI_CONFIGS)
+
+
 def get_date_range_from_variable(hmi_config: dict, is_hourly: bool = False) -> tuple[Optional[datetime], Optional[datetime]]:
     """Variable에서 날짜 범위 읽기 (날짜만 저장된 기존 값도 처리)"""
     from pipeline.data_transfer.hmi_raw_file_etl_config import INDO_TZ
@@ -632,6 +642,8 @@ def download_files(hmi_config: dict, **kwargs) -> dict:
 def generate_summary_report(**kwargs) -> dict:
     """모든 HMI 작업 완료 요약 보고서 생성"""
     ti = kwargs['ti']
+    dag = kwargs.get('dag')
+    configs_to_summarize = get_configs_for_current_dag(dag)
     
     all_results = []
     total_files_listed = 0
@@ -646,8 +658,8 @@ def generate_summary_report(**kwargs) -> dict:
     if date_range and date_range.get('end_date'):
         common_end_date = date_range.get('end_date')
     
-    # 각 HMI별 결과 수집
-    for hmi_config in HMI_CONFIGS:
+    # DAG 대상 HMI별 결과 수집
+    for hmi_config in configs_to_summarize:
         hmi_id = hmi_config['hmi_id']
         list_task_id = f"list_remote_files_{hmi_id}"
         download_task_id = f"download_files_{hmi_id}"
@@ -695,7 +707,7 @@ def generate_summary_report(**kwargs) -> dict:
     
     summary = {
         "timestamp": datetime.now().isoformat(),
-        "total_hmi_count": len(HMI_CONFIGS),
+        "total_hmi_count": len(configs_to_summarize),
         "results": all_results,
         "totals": {
             "files_listed": total_files_listed,
@@ -709,7 +721,7 @@ def generate_summary_report(**kwargs) -> dict:
     logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     logging.info("📊 HMI RAW DATA 수집 작업 완료 요약 (전체)")
     logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    logging.info(f"  📋 처리된 HMI 수: {len(HMI_CONFIGS)}개")
+    logging.info(f"  📋 처리된 HMI 수: {len(configs_to_summarize)}개")
     logging.info(f"  📋 조회된 파일: {total_files_listed}개 ({total_size_listed / 1024 / 1024:.2f} MB)")
     logging.info(f"  📥 다운로드 완료: {total_files_downloaded}개 ({total_size_downloaded / 1024 / 1024:.2f} MB)")
     logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -760,12 +772,18 @@ def update_variable_after_run(**kwargs):
     if date_range and date_range.get('end_date'):
         common_end_date = date_range.get('end_date')
     
+    # DAG 대상 HMI ID 집합 (안전장치: 대상 외 HMI는 업데이트하지 않음)
+    enabled_hmi_ids = {c.get("hmi_id") for c in get_configs_for_current_dag(dag)}
+
     # 각 HMI별로 Variable 업데이트
     updated_count = 0
     skipped_count = 0
     
     for result in summary.get('results', []):
         hmi_id = result.get('hmi_id')
+        if hmi_id not in enabled_hmi_ids:
+            logging.info(f"ℹ️ [{hmi_id}] 현재 DAG 대상이 아니므로 Variable 업데이트 건너뜀")
+            continue
         end_date = result.get('end_date')
         
         # end_date가 없는 경우 (Skip된 경우) 공통 end_date 사용
