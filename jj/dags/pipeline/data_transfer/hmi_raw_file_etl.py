@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.dummy import DummyOperator
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
 
 from pipeline.data_transfer.hmi_raw_file_etl_config import (
     DEFAULT_ARGS,
@@ -247,6 +248,8 @@ def create_hmi_tasks(dag, date_range_func):
     generate_summary_task = PythonOperator(
         task_id="generate_summary_report",
         python_callable=generate_summary_report,
+        # 병렬 브랜치 중 일부가 Skip되어도 요약은 생성되도록 설정
+        trigger_rule=TriggerRule.NONE_FAILED,
         dag=dag,
     )
     
@@ -256,6 +259,8 @@ def create_hmi_tasks(dag, date_range_func):
         update_var_task = PythonOperator(
             task_id="update_variable",
             python_callable=update_variable_after_run,
+            # summary가 성공/Skip 조합에서 실행되도록 none_failed 사용
+            trigger_rule=TriggerRule.NONE_FAILED,
             dag=dag,
         )
     

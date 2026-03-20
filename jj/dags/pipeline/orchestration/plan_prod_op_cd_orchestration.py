@@ -34,19 +34,24 @@ def log_pipeline_start(**kwargs) -> dict:
     php_so_last_time = Variable.get("last_extract_time_sss_php_so", default_var=None)
     rst_last_time = Variable.get("last_extract_time_smp_ss_php_rst", default_var=None)
     
-    # 목표 종료 시점 계산 (오늘 06:30:00 인도네시아 시간)
+    # 목표 종료 시점 계산 (hourly: 실행 시점 -1시간 / daily: 오늘 06:30 인도네시아)
+    INDO_TZ = timezone(timedelta(hours=7))
+    is_hourly = True  # 이 오케스트레이션은 @hourly 기준으로 동작
     if execution_date:
         if execution_date.tzinfo is None:
             execution_date_utc = execution_date.replace(tzinfo=timezone.utc)
         else:
             execution_date_utc = execution_date.astimezone(timezone.utc)
-        
-        INDO_TZ = timezone(timedelta(hours=7))
         execution_date_indo = execution_date_utc.astimezone(INDO_TZ)
-        target_end_date = execution_date_indo.replace(hour=6, minute=30, second=0, microsecond=0)
+        if is_hourly:
+            # 매시간: 해당 실행 시점 -1시간을 시 단위로 내림
+            one_hour_ago = execution_date_indo - timedelta(hours=1)
+            target_end_date = one_hour_ago.replace(minute=0, second=0, microsecond=0)
+        else:
+            target_end_date = execution_date_indo.replace(hour=6, minute=30, second=0, microsecond=0)
         
-        logging.info(f"🚀 Plan Prod OP CD Orchestration 시작: {execution_date}")
-        logging.info(f"📅 목표 종료 시점 (인도네시아): {target_end_date.strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info(f"🚀 Plan Prod OP CD Orchestration 시작 (hourly): {execution_date}")
+        logging.info(f"📅 목표 종료 시점 (인도네시아, 실행-1시간): {target_end_date.strftime('%Y-%m-%d %H:%M:%S')}")
         logging.info(f"📌 SSS IPP SO 마지막 수집 시점: {ipp_so_last_time}")
         logging.info(f"📌 SSS PHP SO 마지막 수집 시점: {php_so_last_time}")
         logging.info(f"📌 SMP SS PHP RST 마지막 수집 시점: {rst_last_time}")
@@ -136,15 +141,20 @@ def log_pipeline_completion(**kwargs) -> dict:
 # ════════════════════════════════════════════════════════════════
 # 3️⃣ DAG Definition
 # ════════════════════════════════════════════════════════════════
+# [전환 시 데이터 누락 없음]
+# - 수집 DAG는 Variable(last_extract_time_*)을 커서로 사용하며, 항상 (Variable+1초) ~ target_end_date 구간만 수집.
+# - hourly 전환 후 첫 실행: 마지막 daily에서 저장한 Variable(예: 전일 06:30)부터 (실행시점-1시간)까지 연속 수집.
+# - 매시간 target이 (실행-1시간)으로 정해지므로 구간이 겹치지 않고 이어짐. Variable은 수집 구간 끝 시각으로만 갱신.
+# [권장] daily → hourly 전환 시, 마지막 daily run이 완료된 뒤(Variable 갱신된 뒤) 스케줄 변경 배포.
 
 with DAG(
     dag_id="plan_prod_op_cd_orchestration",
     default_args=DEFAULT_ARGS,
-    schedule_interval="@daily",  # 매일 UTC 00:00:00 실행
+    schedule_interval="@hourly",
     start_date=datetime(2025, 1, 1),
     catchup=False,
-    description="Plan/Prod OP CD 데이터 수집 파이프라인 - SSS IPP SO, SSS PHP SO, SMP SS PHP RST Incremental",
-    tags=["JJ", "orchestration", "production", "daily", "Plan", "Prod", "OP", "CD"]
+    description="Plan/Prod OP CD 데이터 수집 파이프라인 (hourly) - SSS IPP SO, SSS PHP SO, SMP SS PHP RST Incremental",
+    tags=["JJ", "orchestration", "production", "hourly", "Plan", "Prod", "OP", "CD"]
 ) as dag:
     
     # ════════════════════════════════════════════════════════════════
@@ -159,31 +169,31 @@ with DAG(
     # ════════════════════════════════════════════════════════════════
     # Bronze Layer - Incremental Collection (병렬 실행)
     # ════════════════════════════════════════════════════════════════
+    # hourly 모드로 트리거 → 수집 DAG은 목표 종료 시점을 "실행 시점 -1시간"으로 계산
+    trigger_conf = {"triggered_by": "plan_prod_op_cd_orchestration", "phase": "incremental", "hourly": True}
     trigger_sss_ipp_so = TriggerDagRunOperator(
         task_id="trigger_sss_ipp_so_incremental",
         trigger_dag_id="sss_ipp_so_incremental",
         wait_for_completion=True,
         poke_interval=30,
         reset_dag_run=False,
-        conf={"triggered_by": "plan_prod_op_cd_orchestration", "phase": "incremental"}
+        conf=trigger_conf,
     )
-    
     trigger_sss_php_so = TriggerDagRunOperator(
         task_id="trigger_sss_php_so_incremental",
         trigger_dag_id="sss_php_so_incremental",
         wait_for_completion=True,
         poke_interval=30,
         reset_dag_run=False,
-        conf={"triggered_by": "plan_prod_op_cd_orchestration", "phase": "incremental"}
+        conf=trigger_conf,
     )
-
     trigger_smp_ss_php_rst = TriggerDagRunOperator(
         task_id="trigger_smp_ss_php_rst_raw_incremental",
         trigger_dag_id="smp_ss_php_rst_raw_incremental",
         wait_for_completion=True,
         poke_interval=30,
         reset_dag_run=False,
-        conf={"triggered_by": "plan_prod_op_cd_orchestration", "phase": "incremental"}
+        conf=trigger_conf,
     )
     
     # ════════════════════════════════════════════════════════════════

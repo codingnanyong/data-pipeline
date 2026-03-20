@@ -7,7 +7,10 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.models import Variable
-from dags.pipeline.quality.gold.common.ipi_temperature_matching_common import process_single_date
+from dags.pipeline.quality.gold.common.ipi_temperature_matching_common import (
+    process_single_date,
+    submit_spark_temperature_matching,
+)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -105,6 +108,31 @@ def run_temperature_matching_backfill(**context):
 # 4️⃣ DAG Definition
 # ════════════════════════════════════════════════════════════════
 
+def run_spark_temperature_matching_backfill(**context) -> dict:
+    """Spark 버전 Backfill (병렬 검증) - _spark suffix 테이블에만 적재"""
+    start_date_obj, end_date_obj = get_backfill_date_range(**context)
+
+    if start_date_obj is None or end_date_obj is None:
+        return {"status": "success", "message": "No dates to process"}
+
+    current_date = start_date_obj
+    results = []
+    while current_date <= end_date_obj:
+        date_str = current_date.strftime('%Y-%m-%d')
+        logging.info(f"📅 Spark Backfill [{date_str}] 제출 중...")
+        try:
+            result = submit_spark_temperature_matching(target_date=date_str, suffix="_spark")
+            results.append(result)
+            logging.info(f"✅ Spark Backfill [{date_str}] 완료")
+        except Exception as e:
+            logging.error(f"❌ Spark Backfill [{date_str}] 실패: {e}")
+            raise
+        from datetime import timedelta
+        current_date += timedelta(days=1)
+
+    return {"status": "success", "processed": len(results)}
+
+
 with DAG(
     dag_id="ipi_temperature_matching_backfill",
     default_args=DEFAULT_ARGS,
@@ -113,10 +141,18 @@ with DAG(
     catchup=False,
     tags=["JJ", "IP", "Quality", "Gold layer", "Backfill", "Temperature_matching_model"],
 ) as dag:
-    
+
+    # 기존 pandas 구현 → gold.ipi_temperature_matching (원본, 변경 없음)
     run_backfill_task = PythonOperator(
         task_id="run_temperature_matching_backfill",
         python_callable=run_temperature_matching_backfill,
     )
-    
-    run_backfill_task
+
+    # Spark 구현 → gold.ipi_temperature_matching_spark (병렬 검증용)
+    run_spark_backfill_task = PythonOperator(
+        task_id="run_spark_temperature_matching_backfill",
+        python_callable=run_spark_temperature_matching_backfill,
+    )
+
+    # pandas / Spark 병렬 실행 (서로 독립)
+    [run_backfill_task, run_spark_backfill_task]

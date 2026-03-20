@@ -1,5 +1,9 @@
 """공통 함수 모듈 - IPI Temperature Matching"""
 import logging
+import time
+import requests
+import re
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -12,6 +16,19 @@ from plugins.hooks.postgres_hook import PostgresHelper
 # ════════════════════════════════════════════════════════════════
 
 QUALITY_POSTGRES_CONN_ID = "pg_jj_quality_dw"
+#
+# Avoid hard-coding internal host/path information in code.
+# Set these values via environment variables in Airflow/Docker/K8s.
+#
+# Examples:
+# - LIVY_URL=http://<livy-host>:30998
+# - LIVY_JOB_PATH=hdfs:///jobs/ipi_temperature_matching_spark.py
+# - LIVY_JDBC_JAR=hdfs:///jars/postgresql-jdbc.jar
+#
+LIVY_URL = os.getenv("LIVY_URL", "http://<LIVY_HOST>:30998")
+LIVY_JOB_PATH = os.getenv("LIVY_JOB_PATH", "hdfs:///path/to/ipi_temperature_matching_spark.py")
+LIVY_JDBC_JAR = os.getenv("LIVY_JDBC_JAR", "hdfs:///path/to/postgresql-jdbc.jar")
+
 GOOD_PRODUCT_SCHEMA = "silver"
 GOOD_PRODUCT_TABLE = "ipi_good_product"
 OSND_CROSS_VALIDATED_SCHEMA = "silver"
@@ -30,6 +47,28 @@ ALLOWED_REASON_CDS = ['good', 'Burning', 'Sink mark']
 # 처리할 machine_no 리스트 (ipi_anomaly_transformer_common.py와 동일하게 설정)
 # 예: MACHINE_NO_LIST = ["MCA34", "MCA20", "MCA37"]  # 여러 개 처리
 MACHINE_NO_LIST = ["MCA34"]  # 현재 MCA34만 처리 (온도 데이터와 일치시켜야 함)
+
+
+_REDACTION_PATTERNS = [
+    # HTTP(S) URLs
+    (re.compile(r"https?://[^\s'\"\\)]+"), "<URL_REDACTED>"),
+    # JDBC URLs
+    (re.compile(r"jdbc:[a-zA-Z]+://[^\s'\"\\)]+"), "<JDBC_URL_REDACTED>"),
+    # HDFS paths
+    (re.compile(r"\bhdfs:(//)?[^\s'\"\\)]+"), "<HDFS_PATH_REDACTED>"),
+    # Windows absolute paths (e.g., C:\foo\bar)
+    (re.compile(r"\b[A-Za-z]:\\[^\s'\"\\)]+"), "<WINDOWS_PATH_REDACTED>"),
+]
+
+
+def redact_sensitive_info(text: str) -> str:
+    """Redact sensitive URLs/paths from log messages."""
+    if text is None:
+        return ""
+    s = str(text)
+    for pattern, replacement in _REDACTION_PATTERNS:
+        s = pattern.sub(replacement, s)
+    return s
 
 
 # ════════════════════════════════════════════════════════════════
@@ -241,7 +280,7 @@ def match_temperature_data(df_osnd: pd.DataFrame, df_temp: pd.DataFrame) -> List
             combined_row['temp_L'], combined_row['temp_U'] = temp_low_list, temp_upper_list
             combined_rows.append(combined_row)
         except Exception as e:
-            logging.warning(f"❗ Index {idx} 오류: {e}")
+            logging.warning(f"Index {idx} error: {redact_sensitive_info(e)}")
             unmatched_count += 1
     
     logging.info(f"✅ 온도 데이터 매칭 완료: {len(combined_rows):,} rows")
@@ -294,6 +333,81 @@ def load_data(pg: PostgresHelper, combined_rows: List[Dict], extract_time: datet
 # 5️⃣ Main ETL Logic
 # ════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════
+# 6️⃣ Spark (Livy) 제출 - _spark suffix 테이블 병렬 검증용
+# ════════════════════════════════════════════════════════════════
+
+def ensure_spark_tables_exist(pg: PostgresHelper, suffix: str = "_spark") -> None:
+    """_spark suffix 테이블이 없으면 원본 테이블 스키마로 생성"""
+    for base_table, detail_table in [
+        (TARGET_TABLE, TARGET_DETAIL_TABLE),
+    ]:
+        spark_main   = f"{TARGET_SCHEMA}.{base_table}{suffix}"
+        spark_detail = f"{TARGET_SCHEMA}.{detail_table}{suffix}"
+        pg.execute_query(
+            f"CREATE TABLE IF NOT EXISTS {spark_main} "
+            f"(LIKE {TARGET_SCHEMA}.{base_table} INCLUDING ALL)",
+            task_id="create_spark_main_table", xcom_key=None,
+        )
+        pg.execute_query(
+            f"CREATE TABLE IF NOT EXISTS {spark_detail} "
+            f"(LIKE {TARGET_SCHEMA}.{detail_table} INCLUDING ALL)",
+            task_id="create_spark_detail_table", xcom_key=None,
+        )
+    logging.info(f"✅ _spark 테이블 준비 완료: {suffix}")
+
+
+def submit_spark_temperature_matching(target_date: str, suffix: str = "_spark",
+                                      poll_interval: int = 30,
+                                      max_wait: int = 1800) -> dict:
+    """Livy REST API로 PySpark 온도 매칭 잡 제출 후 완료 대기"""
+    from airflow.hooks.base import BaseHook
+
+    # Airflow Connection에서 PG 접속 정보 획득
+    conn = BaseHook.get_connection(QUALITY_POSTGRES_CONN_ID)
+    jdbc_url = f"jdbc:postgresql://{conn.host}:{conn.port or 5432}/{conn.schema}"
+
+    # _spark 테이블 사전 생성
+    pg = PostgresHelper(conn_id=QUALITY_POSTGRES_CONN_ID)
+    ensure_spark_tables_exist(pg, suffix)
+
+    payload = {
+        "file": LIVY_JOB_PATH,
+        "args": [target_date, suffix, jdbc_url, conn.login, conn.password],
+        "jars": [LIVY_JDBC_JAR],
+        "name": f"ipi_temp_matching_{target_date}{suffix}",
+        "conf": {
+            "spark.executor.memory": "2g",
+            "spark.driver.memory":   "1g",
+            "spark.executor.cores":  "2",
+        },
+    }
+
+    resp = requests.post(f"{LIVY_URL}/batches", json=payload, timeout=30)
+    resp.raise_for_status()
+    batch_id = resp.json()["id"]
+    logging.info(f"🚀 Livy 배치 잡 제출: id={batch_id} | 날짜={target_date} | suffix={suffix}")
+
+    # 완료까지 폴링
+    elapsed = 0
+    while elapsed < max_wait:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        status = requests.get(f"{LIVY_URL}/batches/{batch_id}", timeout=10).json()
+        state  = status.get("state", "unknown")
+        logging.info(f"  Spark 잡 상태: {state} ({elapsed}s 경과)")
+
+        if state == "success":
+            logging.info(f"✅ Spark 잡 완료 (id={batch_id})")
+            return {"batch_id": batch_id, "state": state, "target_date": target_date}
+
+        if state == "dead":
+            # Avoid leaking remote paths/URLs from Livy logs into Airflow logs.
+            raise RuntimeError(f"Spark job failed (id={batch_id}). Check Livy logs for details.")
+
+    raise TimeoutError(f"⏰ Spark 잡 타임아웃 (id={batch_id}, {elapsed}s)")
+
+
 def process_single_date(target_date: str) -> dict:
     """단일 날짜 전체 처리"""
     extract_time = datetime.utcnow()
@@ -313,6 +427,6 @@ def process_single_date(target_date: str) -> dict:
         logging.info(f"✅ [{target_date}] 완료: {len(combined_rows):,} rows, 메인={load_result['main_rows']:,}, 상세={load_result['detail_rows']:,}")
         return {"status": "success", "rows_processed": len(combined_rows), "main_rows": load_result['main_rows'], "detail_rows": load_result['detail_rows'], "processed_date": target_date}
     except Exception as e:
-        logging.error(f"❌ [{target_date}] 실패: {e}", exc_info=True)
+        logging.error(f"[{target_date}] failed: {redact_sensitive_info(e)}", exc_info=True)
         return {"status": "failed", "error": str(e), "processed_date": target_date}
 
