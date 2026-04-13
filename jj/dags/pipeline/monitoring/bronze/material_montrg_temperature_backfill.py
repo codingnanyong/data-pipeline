@@ -10,10 +10,13 @@ from dags.pipeline.monitoring.bronze.common.material_montrg_temperature_common i
     extract_data,
     load_data,
     update_variable,
+    get_postgres_helper,
+    SkipTemperatureCollection,
     INDO_TZ,
     TARGET_POSTGRES_CONN_ID,
     HOURS_OFFSET_FOR_INCREMENTAL,
-    COMPANIES
+    COMPANIES,
+    jakarta_now,
 )
 
 # ────────────────────────────────────────────────────────────────
@@ -50,7 +53,7 @@ def process_daily_batch_for_company(
     data, row_count = extract_data(source_pg, start_str, end_str, company_cd)
     
     if row_count > 0:
-        extract_time = datetime.utcnow()
+        extract_time = jakarta_now()
         loaded_rows = load_data(target_pg, data, extract_time, company_cd)
         logging.info(f"✅ 배치 완료: {start_str} ~ {end_str} ({loaded_rows} rows) for {company_cd}")
     else:
@@ -75,8 +78,19 @@ def backfill_company_task(company_config: dict) -> dict:
 
 def process_company_backfill(company_cd: str, increment_key: str, source_conn_id: str) -> dict:
     """Process backfill for a single company"""
-    source_pg = PostgresHelper(conn_id=source_conn_id)
-    target_pg = PostgresHelper(conn_id=TARGET_POSTGRES_CONN_ID)
+    try:
+        source_pg = get_postgres_helper(source_conn_id, label=company_cd)
+        target_pg = get_postgres_helper(TARGET_POSTGRES_CONN_ID, label="target_dw")
+    except SkipTemperatureCollection as e:
+        logging.warning(
+            f"⏭ {company_cd} Backfill — DB 연결 불가로 전체 스킵(Variable 유지): {e}"
+        )
+        return {
+            "status": "skipped_connection",
+            "company_cd": company_cd,
+            "error": str(e),
+            "results": [],
+        }
     
     # Calculate end date (인도네시아 시간 기준, 2시간 전까지)
     # 예: KST 16:11 -> INDO 14:11 -> 2시간 전 = 12:11 -> 11:59:59까지 수집
@@ -127,6 +141,11 @@ def process_company_backfill(company_cd: str, increment_key: str, source_conn_id
             # Update variable after each successful batch
             update_variable(increment_key, batch_result['end'])
             
+        except SkipTemperatureCollection as e:
+            logging.warning(
+                f"⏭ {company_cd} 루프 {loop_count} 연결 불가로 중단(Variable 유지): {e}"
+            )
+            break
         except Exception as e:
             logging.error(f"❌ {company_cd} 루프 {loop_count} 실패: {str(e)}")
         

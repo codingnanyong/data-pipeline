@@ -33,6 +33,14 @@ INCREMENT_KEY = "ipi_temperature_matching_last_date"
 # 2️⃣ Utility Functions
 # ════════════════════════════════════════════════════════════════
 
+def prepare_incremental_target_date(**context):
+    """DAG run 시작 시 Variable 기준으로 처리일 1회 고정 → pandas/Spark 동일 날짜."""
+    start_date, end_date = get_processing_time_range(**context)
+    if start_date is None or end_date is None:
+        return None
+    return {"date": start_date}
+
+
 def get_processing_time_range(**context) -> Tuple[str, str]:
     """Airflow Variable에서 처리 시간 범위 가져오기 (Incremental: 1일치)"""
     last_date_str = None
@@ -68,11 +76,12 @@ def get_processing_time_range(**context) -> Tuple[str, str]:
 
 def run_temperature_matching(**context) -> dict:
     """메인 ETL 함수 (증분 처리) - 기존 pandas 구현 (원본 테이블)"""
-    start_date, end_date = get_processing_time_range(**context)
-
-    if start_date is None or end_date is None:
+    info = context["ti"].xcom_pull(task_ids="prepare_incremental_target_date")
+    if not info:
         logging.info("✅ 처리할 날짜가 없습니다. (이미 최신 상태)")
         return {"status": "success", "rows_processed": 0, "message": "Already up to date", "processed_date": None}
+
+    start_date = info["date"]
 
     try:
         result = process_single_date(start_date)
@@ -89,9 +98,20 @@ def run_temperature_matching(**context) -> dict:
 
 
 def run_spark_temperature_matching(**context) -> dict:
-    """Spark 버전 ETL (병렬 검증) - 항상 2일 전 데이터를 처리, _spark suffix 테이블에만 적재"""
-    target_date = (datetime.utcnow() - timedelta(days=2)).strftime('%Y-%m-%d')
-    logging.info(f"🔥 Spark 처리 날짜 (고정 2일 전): {target_date}")
+    """Spark 버전 ETL (병렬 검증) — pandas 증분과 동일 처리일, _spark 테이블만 적재."""
+    info = context["ti"].xcom_pull(task_ids="prepare_incremental_target_date")
+    if not info:
+        logging.info(
+            "✅ Spark 증분 스킵: 처리할 날짜 없음 (pandas와 동일 — 이미 최신). "
+            "Livy 잡 미제출."
+        )
+        return {
+            "status": "skipped",
+            "message": "No incremental date; Livy batch not submitted",
+        }
+
+    target_date = info["date"]
+    logging.info("🔥 Spark 증분 처리일 (pandas와 동일): %s", target_date)
     return submit_spark_temperature_matching(target_date=target_date, suffix="_spark")
 
 
@@ -108,6 +128,11 @@ with DAG(
     tags=["JJ", "IP", "Quality", "Gold layer", "Incremental", "Temperature_matching_model"],
 ) as dag:
 
+    prepare_incremental_task = PythonOperator(
+        task_id="prepare_incremental_target_date",
+        python_callable=prepare_incremental_target_date,
+    )
+
     # 기존 pandas 구현 → gold.ipi_temperature_matching (원본, 변경 없음)
     temperature_matching_task = PythonOperator(
         task_id="run_temperature_matching",
@@ -120,6 +145,5 @@ with DAG(
         python_callable=run_spark_temperature_matching,
     )
 
-    # pandas / Spark 병렬 실행 (서로 독립)
-    [temperature_matching_task, spark_temperature_matching_task]
+    prepare_incremental_task >> [temperature_matching_task, spark_temperature_matching_task]
 

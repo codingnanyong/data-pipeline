@@ -55,13 +55,34 @@ def get_backfill_date_range(**context):
     return start_date, today_minus_2
 
 
+def prepare_backfill_date_range(**context):
+    """DAG run 시작 시 Variable을 한 번만 읽어 범위를 XCom에 고정 (pandas가 Variable을 갱신해도 Spark와 동일 구간 유지)."""
+    start_date_obj, end_date_obj = get_backfill_date_range(**context)
+    if start_date_obj is None or end_date_obj is None:
+        return None
+    return {
+        "start": start_date_obj.isoformat(),
+        "end": end_date_obj.isoformat(),
+    }
+
+
+def _parse_date_range_from_xcom(ti):
+    """prepare_backfill_date_range XCom → (start_date, end_date) 또는 (None, None)."""
+    range_info = ti.xcom_pull(task_ids="prepare_backfill_date_range")
+    if not range_info:
+        return None, None
+    start_date_obj = datetime.strptime(range_info["start"], "%Y-%m-%d").date()
+    end_date_obj = datetime.strptime(range_info["end"], "%Y-%m-%d").date()
+    return start_date_obj, end_date_obj
+
+
 # ════════════════════════════════════════════════════════════════
 # 3️⃣ Main Backfill Logic
 # ════════════════════════════════════════════════════════════════
 
 def run_temperature_matching_backfill(**context):
     """Backfill 메인 함수: 2025-01-01부터 -2일 전까지 순차 처리"""
-    start_date_obj, end_date_obj = get_backfill_date_range(**context)
+    start_date_obj, end_date_obj = _parse_date_range_from_xcom(context["ti"])
     
     if start_date_obj is None or end_date_obj is None:
         return {"status": "success", "message": "No dates to process"}
@@ -110,7 +131,7 @@ def run_temperature_matching_backfill(**context):
 
 def run_spark_temperature_matching_backfill(**context) -> dict:
     """Spark 버전 Backfill (병렬 검증) - _spark suffix 테이블에만 적재"""
-    start_date_obj, end_date_obj = get_backfill_date_range(**context)
+    start_date_obj, end_date_obj = _parse_date_range_from_xcom(context["ti"])
 
     if start_date_obj is None or end_date_obj is None:
         return {"status": "success", "message": "No dates to process"}
@@ -121,13 +142,17 @@ def run_spark_temperature_matching_backfill(**context) -> dict:
         date_str = current_date.strftime('%Y-%m-%d')
         logging.info(f"📅 Spark Backfill [{date_str}] 제출 중...")
         try:
-            result = submit_spark_temperature_matching(target_date=date_str, suffix="_spark")
+            # 백필은 일자 수가 많을 수 있어 잡당 대기 시간을 넉넉히 둠
+            result = submit_spark_temperature_matching(
+                target_date=date_str,
+                suffix="_spark",
+                max_wait=7200,
+            )
             results.append(result)
             logging.info(f"✅ Spark Backfill [{date_str}] 완료")
         except Exception as e:
             logging.error(f"❌ Spark Backfill [{date_str}] 실패: {e}")
             raise
-        from datetime import timedelta
         current_date += timedelta(days=1)
 
     return {"status": "success", "processed": len(results)}
@@ -142,6 +167,12 @@ with DAG(
     tags=["JJ", "IP", "Quality", "Gold layer", "Backfill", "Temperature_matching_model"],
 ) as dag:
 
+    # Variable 기준 범위를 run 시작 시 한 번만 계산 → Spark가 pandas보다 늦게 시작해도 동일 일자 처리
+    prepare_backfill_range_task = PythonOperator(
+        task_id="prepare_backfill_date_range",
+        python_callable=prepare_backfill_date_range,
+    )
+
     # 기존 pandas 구현 → gold.ipi_temperature_matching (원본, 변경 없음)
     run_backfill_task = PythonOperator(
         task_id="run_temperature_matching_backfill",
@@ -154,5 +185,4 @@ with DAG(
         python_callable=run_spark_temperature_matching_backfill,
     )
 
-    # pandas / Spark 병렬 실행 (서로 독립)
-    [run_backfill_task, run_spark_backfill_task]
+    prepare_backfill_range_task >> [run_backfill_task, run_spark_backfill_task]

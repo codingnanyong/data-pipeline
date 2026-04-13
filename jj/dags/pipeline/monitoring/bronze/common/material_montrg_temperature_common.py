@@ -1,8 +1,14 @@
 """공통 함수 모듈 - Material Monitoring Temperature Raw"""
+import errno
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from plugins.hooks.postgres_hook import PostgresHelper
 from airflow.models import Variable
+
+
+class SkipTemperatureCollection(Exception):
+    """소스/타겟 DB에 연결할 수 없을 때. 워터마크(Variable)를 진행시키지 말 것."""
 
 
 # ════════════════════════════════════════════════════════════════
@@ -15,7 +21,9 @@ SCHEMA_NAME = "bronze"
 TARGET_POSTGRES_CONN_ID = "pg_jj_monitoring_dw"
 INDO_TZ = timezone(timedelta(hours=7))  # 인도네시아 시간 (UTC+7)
 INITIAL_START_DATE = datetime(2025, 8, 1, 0, 0, 0)
-HOURS_OFFSET_FOR_INCREMENTAL = 2  # 2시간 전 데이터까지 수집
+HOURS_OFFSET_FOR_INCREMENTAL = 2  # (backfill에서 사용) 2시간 전 데이터까지 수집
+INCREMENTAL_WINDOW_MINUTES = 10  # 증분 수집 윈도우 (분 단위)
+INCREMENTAL_SAFE_LAG_MINUTES = 0  # (incremental에서 사용) 현재 시각 대비 안전 마진(분)
 
 # Company Configuration - 배열로 관리
 COMPANIES = [
@@ -54,6 +62,96 @@ def calculate_expected_daily_loops(start_date: datetime, end_date: datetime) -> 
     return (end_date.date() - start_date.date()).days + 1
 
 
+def _is_db_connection_error(exc: BaseException) -> bool:
+    """연결/네트워크 계열 오류인지 판별 (쿼리 문법 오류 등과 구분)."""
+    t = type(exc)
+    name = t.__name__
+    mod = getattr(t, "__module__", "") or ""
+    if "psycopg2" in mod or "psycopg" in mod:
+        if name in ("OperationalError", "InterfaceError"):
+            return True
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) is not None:
+        if exc.errno in (
+            errno.ECONNREFUSED,
+            errno.ETIMEDOUT,
+            errno.ENETUNREACH,
+            errno.EHOSTUNREACH,
+            errno.ECONNRESET,
+        ):
+            return True
+    msg = str(exc).lower()
+    needles = (
+        "could not connect",
+        "connection refused",
+        "connection timed out",
+        "timeout expired",
+        "server closed the connection",
+        "connection reset",
+        "connection lost",
+        "connection to server",
+        "no route to host",
+        "name or service not known",
+        "could not translate host name",
+        "broken pipe",
+        "ssl syscall error",
+        "network is unreachable",
+    )
+    return any(n in msg for n in needles)
+
+
+def get_postgres_helper(conn_id: str, label: str = "") -> PostgresHelper:
+    """PostgresHelper 생성 시 훅이 즉시 연결 검증하는 경우 연결 실패면 SkipTemperatureCollection."""
+    try:
+        return PostgresHelper(conn_id=conn_id)
+    except Exception as e:
+        if _is_db_connection_error(e):
+            tag = label or conn_id
+            logging.warning(f"⏭ {tag} DB 연결 불가 — 수집 스킵: {e}")
+            raise SkipTemperatureCollection(str(e)) from e
+        raise
+
+
+def floor_time_to_window(dt: datetime, window_minutes: int) -> datetime:
+    """내림: dt를 window_minutes 단위로 내림(초/마이크로초 0)."""
+    if window_minutes <= 0 or 60 % window_minutes != 0:
+        raise ValueError(f"window_minutes must divide 60: {window_minutes}")
+    floored_minute = (dt.minute // window_minutes) * window_minutes
+    return dt.replace(minute=floored_minute, second=0, microsecond=0)
+
+
+def format_dt_no_tz(dt: datetime) -> str:
+    """Airflow Variable 저장 포맷(타임존 제거, 초 단위)."""
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def jakarta_now() -> datetime:
+    """적재 etl_extract_time: Asia/Jakarta timezone-aware."""
+    return datetime.now(INDO_TZ)
+
+
+def localize_source_ts_for_insert(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=INDO_TZ)
+        return value
+    return value
+
+
+def get_variable_datetime(key: str) -> Optional[datetime]:
+    """Airflow Variable을 datetime으로 읽기 (없으면 None)."""
+    raw = Variable.get(key, default_var=None)
+    if not raw:
+        return None
+    dt = parse_datetime(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=INDO_TZ)
+    return dt
+
+
 def get_company_start_date(increment_key: str, company_name: str, initial_date: datetime = None) -> datetime:
     """Get start date for specific company
     
@@ -75,10 +173,17 @@ def get_company_start_date(increment_key: str, company_name: str, initial_date: 
         return start_time
     else:
         if initial_date:
-            # Incremental mode: use 1 hour ago if no variable
+            # Incremental mode: use the previous full window if no variable
             now_indo = datetime.now(INDO_TZ)
-            start_time = (now_indo - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-            logging.info(f"{company_name} - Variable이 없어 직전 1시간 구간({start_time.strftime('%Y-%m-%d %H:00:00')})부터 수집")
+            safe_now = now_indo - timedelta(minutes=INCREMENTAL_SAFE_LAG_MINUTES)
+            start_time = floor_time_to_window(
+                safe_now - timedelta(minutes=INCREMENTAL_WINDOW_MINUTES),
+                INCREMENTAL_WINDOW_MINUTES,
+            )
+            logging.info(
+                f"{company_name} - Variable이 없어 직전 {INCREMENTAL_WINDOW_MINUTES}분 구간("
+                f"{start_time.strftime('%Y-%m-%d %H:%M:00')})부터 수집"
+            )
             return start_time
         else:
             # Backfill mode: use INITIAL_START_DATE
@@ -118,15 +223,23 @@ def extract_data(pg: PostgresHelper, start_date: str, end_date: str, source_name
     """Extract data from PostgreSQL database"""
     sql = build_extract_sql(start_date, end_date)
     logging.info(f"{source_name} - 실행 쿼리: {sql}")
-    
-    data = pg.execute_query(sql, task_id=f"extract_data_{source_name}", xcom_key=None)
-    
+
+    try:
+        data = pg.execute_query(sql, task_id=f"extract_data_{source_name}", xcom_key=None)
+    except Exception as e:
+        if _is_db_connection_error(e):
+            logging.warning(
+                f"⏭ {source_name} 소스 DB 연결/네트워크 문제로 추출 스킵: {e}"
+            )
+            raise SkipTemperatureCollection(str(e)) from e
+        raise
+
     # Calculate row count
     if data and isinstance(data, list):
         row_count = len(data)
     else:
         row_count = 0
-    
+
     logging.info(f"{source_name} - {start_date} ~ {end_date} 추출 row 수: {row_count}")
     return data, row_count
 
@@ -145,9 +258,10 @@ def prepare_insert_data(data: list, company_cd: str, extract_time: datetime) -> 
         return [
             (
                 company_cd,
-                row['sensor_id'], row['device_id'], row['ymd'], row['hmsf'], row['capture_dt'],
+                row['sensor_id'], row['device_id'], row['ymd'], row['hmsf'],
+                localize_source_ts_for_insert(row['capture_dt']),
                 row['t1'], row['t2'], row['t3'], row['t4'], row['t5'], row['t6'],
-                row['upload_yn'], row['upload_dt'],
+                row['upload_yn'], localize_source_ts_for_insert(row['upload_dt']),
                 extract_time
             ) for row in data
         ]
@@ -158,9 +272,10 @@ def prepare_insert_data(data: list, company_cd: str, extract_time: datetime) -> 
         return [
             (
                 company_cd,
-                row[2], row[3], row[0], row[1], row[4],  # sensor_id, device_id, ymd, hmsf, capture_dt
-                row[5], row[6], row[7], row[8], row[9], row[10],  # t1(temperature)~t6(fine_dust10)
-                row[11], row[12],  # upload_yn, upload_dt
+                row[2], row[3], row[0], row[1],
+                localize_source_ts_for_insert(row[4]),
+                row[5], row[6], row[7], row[8], row[9], row[10],
+                row[11], localize_source_ts_for_insert(row[12]),
                 extract_time
             ) for row in data
         ]
@@ -191,10 +306,19 @@ def load_data(
     prepared_data = prepare_insert_data(data, company_cd, extract_time)
     columns = get_column_names()
     conflict_columns = ["company_cd", "sensor_id", "capture_dt"]
-    
-    pg.insert_data(schema_name, table_name, prepared_data, columns, conflict_columns)
+
+    try:
+        pg.insert_data(schema_name, table_name, prepared_data, columns, conflict_columns)
+    except Exception as e:
+        if _is_db_connection_error(e):
+            logging.warning(
+                f"⏭ {company_cd} 타겟 DB 연결/네트워크 문제로 적재 스킵: {e}"
+            )
+            raise SkipTemperatureCollection(str(e)) from e
+        raise
+
     logging.info(f"✅ {company_cd} - {len(prepared_data)} rows inserted (duplicates ignored).")
-    
+
     return len(prepared_data)
 
 

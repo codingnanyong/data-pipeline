@@ -22,7 +22,7 @@ from cosmos.profiles import PostgresUserPasswordProfileMapping
 # 상수 정의
 # ============================================================================
 
-# 경로 설정
+# 경로 설정 (dbt ProjectConfig 경로)
 DBT_PROJECT_DIR = "/opt/airflow/dags/dbt/unified_montrg"
 if DBT_PROJECT_DIR not in sys.path:
     sys.path.insert(0, DBT_PROJECT_DIR)
